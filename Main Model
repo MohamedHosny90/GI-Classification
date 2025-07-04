@@ -1,0 +1,162 @@
+from tensorflow.keras.layers import Layer, GlobalAveragePooling2D, Conv1D, Multiply, Reshape, Add, Conv2D, BatchNormalization, Activation, Dense, Dropout, Input, MaxPooling2D, Concatenate, AveragePooling2D, GlobalMaxPooling2D
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.models import Model, load_model
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import ModelCheckpoint, ReduceLROnPlateau
+import keras
+import tensorflow as tf
+import os
+from tensorflow.keras.layers import Conv2D, MaxPooling2D, Activation, Lambda, GlobalAveragePooling2D, Dense, Add, Input, BatchNormalization  # Add BatchNormalization here
+from tensorflow.keras.applications import DenseNet201
+############################################Attention Mechanisms##########################
+# Custom Layers (SE Block)
+@keras.saving.register_keras_serializable()
+class SEBlock(Layer):
+    def __init__(self, ratio=16, **kwargs):
+        super(SEBlock, self).__init__(**kwargs)
+        self.ratio = ratio
+
+    def build(self, input_shape):
+        self.num_channels = input_shape[-1]
+        self.squeeze = GlobalAveragePooling2D()
+        self.excitation = Dense(self.num_channels // self.ratio, activation='relu')
+        self.scale = Dense(self.num_channels, activation='sigmoid')
+
+    def call(self, inputs):
+        # Squeeze: Global Average Pooling
+        x = self.squeeze(inputs)
+        x = Reshape((1, 1, self.num_channels))(x)
+
+        # Excitation: Two fully connected layers
+        x = self.excitation(x)
+        x = self.scale(x)
+ # Scale: Multiply the input with the excitation output
+        return Multiply()([inputs, x])
+##########################################################################        
+# Residual Block with Bottleneck
+def residual_block(x, filters, strides=1):
+    shortcut = x
+    x = Conv2D(filters, (1, 1), strides=strides, padding='same')(x)
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+
+    x = Conv2D(filters, (3, 3), padding='same')(x)
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+
+    x = Conv2D(filters * 4, (1, 1), padding='same')(x)
+    x = BatchNormalization()(x)
+
+    if strides != 1 or shortcut.shape[-1] != filters * 4:
+        shortcut = Conv2D(filters * 4, (1, 1), strides=strides, padding='same')(shortcut)
+        shortcut = BatchNormalization()(shortcut)
+
+    x = Add()([x, shortcut])
+    x = Activation('relu')(x)
+    return x
+##################################################################################
+# Global Context Block
+def global_context_block(x):
+    gap = GlobalAveragePooling2D()(x)
+    gap = Reshape((1, 1, gap.shape[-1]))(gap)
+    gap = Conv2D(x.shape[-1], (1, 1), activation='sigmoid')(gap)
+    return Multiply()([x, gap])
+##################################################################################
+train_data = ImageDataGenerator(
+    rescale=1./255)
+validation_data = ImageDataGenerator(rescale=1./255)
+test_data = ImageDataGenerator(rescale=1./255)
+
+# Load train, validation, and test sets using flow_from_directory
+train_data = train_data.flow_from_directory(
+    train_folder,
+    target_size=(224, 224),
+    batch_size=20,
+    color_mode='rgb',
+    shuffle=True,
+    class_mode='categorical'
+)
+
+validation_data = validation_data.flow_from_directory(
+    validation_folder,
+    target_size=(224, 224),
+    batch_size=20,
+    color_mode='rgb',
+    shuffle=False,
+    class_mode='categorical'
+)
+
+test_data = test_data.flow_from_directory(
+    test_folder,
+    target_size=(224, 224),
+    batch_size=20,
+    color_mode='rgb',
+    shuffle=False,
+    class_mode='categorical'
+)
+##################################################################################
+def inception_module(x, filters):
+    """Inception module with dimension reductions"""
+    # 1x1 branch
+    branch1x1 = Conv2D(filters[0], (1, 1), padding='same', activation='relu')(x)
+    
+    # 3x3 branch
+    branch3x3 = Conv2D(filters[1], (1, 1), padding='same', activation='relu')(x)
+    branch3x3 = Conv2D(filters[2], (3, 3), padding='same', activation='relu')(branch3x3)
+    
+    # 5x5 branch
+    branch5x5 = Conv2D(filters[3], (1, 1), padding='same', activation='relu')(x)
+    branch5x5 = Conv2D(filters[4], (5, 5), padding='same', activation='relu')(branch5x5)
+    
+    # Pooling branch
+    branch_pool = AveragePooling2D((3, 3), strides=(1, 1), padding='same')(x)
+    branch_pool = Conv2D(filters[5], (1, 1), padding='same', activation='relu')(branch_pool)
+    
+    # Concatenate all branches
+    return Concatenate()([branch1x1, branch3x3, branch5x5, branch_pool])
+####################################################################################
+# Custom Inception-Attention Block
+def inception_mfr_attention_block(x, filters, attention_type='se'):
+    """Inception -> Attention block"""
+    # First process through Inception module
+    x = inception_module(x, filters)
+    x = residual_block(x, filters=64, strides=2)
+    x = residual_block(x, filters=64, strides=1)
+    # Finally apply attention
+    if attention_type == 'se':
+       x = SEBlock()(x)    
+    return Activation('relu')(x)
+   
+# Load DenseNet201 as a feature extractor
+densenet201_base = DenseNet201(include_top=False, weights='imagenet', input_shape=(224, 224, 3))
+
+x = densenet201_base.output
+x = inception_mfr_attention_block(x, [32, 32, 64, 32, 64, 32], attention_type='se')
+
+# Global Context Block
+x = global_context_block(x)
+# Final layers
+x = GlobalAveragePooling2D()(x)
+output = Dense(8, activation='softmax')(x)
+
+# Define the complete model
+model = Model(inputs=densenet201_base.input, outputs=output)
+# Compile
+model.compile(optimizer=Adam(learning_rate=0.0001), 
+              loss='categorical_crossentropy', 
+              metrics=['accuracy'])
+
+# Callbacks
+reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=2, min_lr=1e-6)
+model_checkpoint = ModelCheckpoint("model_inception_mfr_attention.keras", save_best_only=True, monitor='val_loss')
+
+# Train
+history = model.fit(
+    train_data,
+    epochs=20,
+    validation_data=validation_data,
+    callbacks=[reduce_lr, model_checkpoint]
+)
+
+# Save
+model.save("model_inception_mfr_attention.keras")
